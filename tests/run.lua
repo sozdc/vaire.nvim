@@ -380,6 +380,47 @@ test("does not publish a note before created directory metadata is synchronized"
     equal(uv.fs_lstat(path), nil, "note must not be published before its parent metadata is durable")
   end)
 end)
+test("reports post-publication directory sync failure without leaving a temporary link", function()
+  with_root(function(root)
+    local resolved = config.resolve({ root = root })
+    truthy(notes.ensure_configured_directories(resolved))
+    local path = notes.note_path(resolved, "published-after-sync-error.md")
+    local parent = vim.fs.dirname(path)
+    local original_fsync = uv.fs_fsync
+    uv.fs_fsync = function(file)
+      local stat = uv.fs_fstat(file)
+      if stat and stat.type == "directory" then
+        return nil, "forced post-publication directory synchronization failure"
+      end
+      return original_fsync(file)
+    end
+    local ok, result, message = pcall(
+      notes.ensure_file,
+      resolved,
+      resolved.notes.directory_abs,
+      path,
+      { "complete payload" }
+    )
+    uv.fs_fsync = original_fsync
+    if not ok then
+      error(result, 0)
+    end
+
+    equal(result, nil)
+    truthy(message:find("note was published but directory synchronization failed", 1, true), message)
+    equal(read_file(path), "complete payload\n")
+    local directory = uv.fs_scandir(parent)
+    truthy(directory, "could not inspect note parent")
+    while true do
+      local name = uv.fs_scandir_next(directory)
+      if not name then
+        break
+      end
+      truthy(not name:match("^%.vaire%-write%-"), "temporary note link remains: " .. name)
+    end
+  end)
+end)
+
 
 test("creates configured and nested parent directories safely", function()
   with_root(function(root)
@@ -669,7 +710,7 @@ test("supports safe setup, discovery, and reusable note windows", function()
     end
 
     local resolved = vaire.setup({ root = root, mappings = true })
-    equal(vaire.setup({ root = root, mappings = true }), resolved, "identical setup must be idempotent")
+    truthy(vim.deep_equal(vaire.setup({ root = root, mappings = true }), resolved), "identical setup must be value-idempotent")
     expect_error(function()
       vaire.setup({ root = root, notes = { directory = "other-notes" } })
     end, "different options")
@@ -690,28 +731,42 @@ test("supports safe setup, discovery, and reusable note windows", function()
     equal(git_mapping.desc, "Open Vaire lazygit")
     local original_executable = vim.fn.executable
     local original_termopen = vim.fn.termopen
-    local executable_name
-    local terminal_command
-    local terminal_options
+    local terminal_sessions = {}
     vim.fn.executable = function(command)
-      executable_name = command
+      equal(command, "lazygit")
       return 1
     end
     vim.fn.termopen = function(command, options)
-      terminal_command = command
-      terminal_options = options
-      return 4242
+      terminal_sessions[#terminal_sessions + 1] = { command = command, options = options }
+      return 4242 + #terminal_sessions
     end
     local git_window, git_error = vaire.git()
+    truthy(git_window, git_error)
+    equal(terminal_sessions[1].command[1], "lazygit")
+    equal(terminal_sessions[1].options.cwd, root)
+    local same_root_session, same_root_error = vaire.git()
+    truthy(same_root_session, same_root_error)
+    equal(same_root_session, git_window, "same-root lazygit call must reuse its terminal")
+    equal(#terminal_sessions, 1)
+
+    local second_root = vim.fs.joinpath(root, "other-vault")
+    truthy(vim.fn.mkdir(second_root, "p") == 1, "could not create second git root")
+    local vaire_ui = require("vaire.ui")
+    local replacement, replacement_error = vaire_ui.open_git(second_root)
+    truthy(replacement, replacement_error)
+    equal(#terminal_sessions, 2, "different-root lazygit call must start a new terminal")
+    equal(terminal_sessions[2].options.cwd, second_root)
+    terminal_sessions[1].options.on_exit(0, 0)
+    vim.wait(20, function()
+      return false
+    end, 10)
+    truthy(vim.api.nvim_win_is_valid(replacement.win), "old job exit closed the replacement session")
+    terminal_sessions[2].options.on_exit(0, 0)
+    vim.wait(20, function()
+      return false
+    end, 10)
     vim.fn.executable = original_executable
     vim.fn.termopen = original_termopen
-    truthy(git_window, git_error)
-    equal(executable_name, "lazygit")
-    equal(terminal_command[1], "lazygit")
-    equal(terminal_options.cwd, root)
-    vim.cmd("VaireGit")
-    truthy(vim.api.nvim_win_is_valid(git_window.win), "VaireGit did not keep lazygit open")
-    vim.api.nvim_win_close(git_window.win, true)
     vim.cmd("stopinsert")
 
     local find_picker = vaire.find()
@@ -774,7 +829,7 @@ test("supports safe setup, discovery, and reusable note windows", function()
   end)
 end)
 
-test("prompts for and persists roots without changing strict setup", function()
+test("prompts for and persists roots without changing prompted setup", function()
   with_root(function(root)
     local original_stdpath = vim.fn.stdpath
     local original_input = vim.ui.input
@@ -836,6 +891,74 @@ test("prompts for and persists roots without changing strict setup", function()
       truthy(callback, "there is no pending Vaire input prompt")
       callback(value)
     end
+
+    local invalid_dependency_root = vim.fs.joinpath(root, "invalid-dependency-vault")
+    local valid_snacks = package.loaded["snacks"]
+    package.loaded["snacks"] = {}
+    expect_error(function()
+      fresh_plugin().setup({ root = invalid_dependency_root })
+    end, "required")
+    equal(uv.fs_lstat(invalid_dependency_root), nil, "failed dependency setup created the vault")
+    for _, name in ipairs({ "VaireDaily", "VaireFind", "VaireSearch", "VaireNew", "VaireGit" }) do
+      equal(vim.fn.exists(":" .. name), 0, "failed dependency setup left command " .. name)
+    end
+    package.loaded["snacks"] = valid_snacks
+
+    local portable_root = vim.fs.joinpath(root, "new-machine", "Vaire")
+    local portable = fresh_plugin()
+    local portable_config = portable.setup({
+      root = portable_root,
+      notes = { directory = "notes/team", daily_directory = "daily/archive" },
+    })
+    equal(portable_config.root_real, portable_root)
+    for _, directory in ipairs({ portable_root, "notes", "notes/team", "daily", "daily/archive", "99-System" }) do
+      local path = directory == portable_root and directory or vim.fs.joinpath(portable_root, directory)
+      equal(uv.fs_lstat(path).type, "directory", "setup did not create " .. path)
+    end
+    equal(#input_prompts, 0, "a configured strict root must not prompt")
+    local note = vim.fs.joinpath(portable_root, "notes/team", "welcome.md")
+    equal(portable.new("welcome").kind, "open")
+    equal(read_file(note), "# Welcome\n\n")
+    portable_config.notes.directory = "mutated"
+    portable_config.mappings = true
+    local repeated_config = portable.setup({
+      root = portable_root,
+      notes = { directory = "notes/team", daily_directory = "daily/archive" },
+    })
+    truthy(vim.deep_equal(repeated_config, config.resolve({
+      root = portable_root,
+      notes = { directory = "notes/team", daily_directory = "daily/archive" },
+    })), "identical setup must return the original settings snapshot")
+    truthy(repeated_config ~= portable_config, "setup must return a new configuration snapshot")
+    equal(portable.new("still-configured").kind, "open")
+    equal(read_file(vim.fs.joinpath(portable_root, "notes/team", "still-configured.md")), "# Still Configured\n\n")
+    equal(uv.fs_lstat(vim.fs.joinpath(portable_root, "mutated", "still-configured.md")), nil)
+    local system_file = vim.fs.joinpath(portable_root, "99-System", "existing.md")
+    write_file(system_file, "keep\n")
+    fresh_plugin().setup({
+      root = portable_root,
+      notes = { directory = "notes/team", daily_directory = "daily/archive" },
+    })
+    equal(read_file(system_file), "keep\n", "new setup must preserve existing system content")
+    local linked_system_root = vim.fs.joinpath(root, "linked-system-vault")
+    truthy(vim.fn.mkdir(linked_system_root, "p") == 1, "could not create vault fixture")
+    truthy(uv.fs_symlink(portable_root, vim.fs.joinpath(linked_system_root, "99-System")), "could not create system symlink")
+    expect_error(function()
+      fresh_plugin().setup({ root = linked_system_root })
+    end, "symbolic link")
+    local shortcut = vim.fs.joinpath(root, "shortcut")
+    truthy(uv.fs_symlink(portable_root, shortcut), "could not create root symlink fixture")
+    expect_error(function()
+      fresh_plugin().setup({ root = vim.fs.joinpath(shortcut, "escaped") })
+    end, "symbolic link")
+    equal(uv.fs_lstat(vim.fs.joinpath(portable_root, "escaped")), nil, "setup followed a symbolic link")
+    local blocking_file = vim.fs.joinpath(root, "blocking-file")
+    write_file(blocking_file, "keep\n")
+    expect_error(function()
+      fresh_plugin().setup({ root = vim.fs.joinpath(blocking_file, "vault") })
+    end, "not a directory")
+    equal(read_file(blocking_file), "keep\n", "setup changed an existing file")
+    events = {}
 
     local vault = vim.fs.joinpath(root, "vault")
     truthy(vim.fn.mkdir(vault, "p") == 1, "could not create selected vault")

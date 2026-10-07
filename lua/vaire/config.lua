@@ -141,7 +141,8 @@ local function validate_root(root, allow_missing)
   return root_real
 end
 
-function M.resolve(opts)
+-- Missing roots are accepted only for prompt mode or setup preflight; root_real stays nil until validation finds an existing real directory.
+function M.resolve(opts, allow_missing_root)
   if type(opts) ~= "table" then
     fail("setup options are required")
   end
@@ -165,7 +166,7 @@ function M.resolve(opts)
       fail("root must be an explicit non-empty path")
     end
     root = vim.fs.normalize(vim.trim(expand_root(opts.root)))
-    root_real = validate_root(root, prompt_root)
+    root_real = validate_root(root, prompt_root or allow_missing_root)
   end
 
   local notes_opts = opts.notes

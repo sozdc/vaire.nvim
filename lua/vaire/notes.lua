@@ -201,6 +201,18 @@ local function ensure_directory(path, boundary, label)
   return real
 end
 
+function M.ensure_root(root)
+  local current = "/"
+  for _, part in ipairs(vim.split(root, "/", { plain = true, trimempty = true })) do
+    current = vim.fs.joinpath(current, part)
+    local real, message = ensure_directory(current, current, "vault root component")
+    if not real then
+      return nil, message
+    end
+  end
+  return true
+end
+
 local function configured_directory(config, directory)
   if directory ~= config.notes.directory_abs and directory ~= config.notes.daily_directory_abs then
     return nil, "note directory is not configured"
@@ -231,6 +243,21 @@ local function configured_directory(config, directory)
     return nil, "configured directory resolves outside the vault"
   end
   return real
+end
+
+function M.ensure_configured_directories(config)
+  for _, directory in ipairs({ config.notes.directory_abs, config.notes.daily_directory_abs }) do
+    local real, message = configured_directory(config, directory)
+    if not real then
+      return nil, message
+    end
+  end
+  local system_directory = vim.fs.joinpath(config.root, "99-System")
+  local real, message = ensure_directory(system_directory, config.root_real, "system directory")
+  if not real then
+    return nil, message
+  end
+  return true
 end
 
 local function candidate_parent(configured, configured_real, path)
@@ -310,6 +337,83 @@ local function cleanup_temporary(file, temp_path, message)
   end
   return invalid(table.concat(errors, "; "))
 end
+local function prepare_temporary_note(parent, configured_real, data)
+  local temp_template = vim.fs.joinpath(parent, ".vaire-write-XXXXXX")
+  local file, temp_path, temp_error = uv.fs_mkstemp(temp_template)
+  if not file then
+    return nil, "could not create temporary note: " .. tostring(temp_error)
+  end
+
+  local stable, stable_error = validate_existing_directory(parent, configured_real, "note parent")
+  if not stable then
+    return cleanup_temporary(file, temp_path, stable_error)
+  end
+  local chmodded, chmod_error = uv.fs_fchmod(file, NOTE_MODE)
+  if not chmodded then
+    return cleanup_temporary(file, temp_path, "could not set note permissions: " .. tostring(chmod_error))
+  end
+  local written, write_error = write_all(file, data)
+  if not written then
+    return cleanup_temporary(file, temp_path, "could not write note: " .. tostring(write_error))
+  end
+  local synced, sync_error = uv.fs_fsync(file)
+  if not synced then
+    return cleanup_temporary(file, temp_path, "could not synchronize note: " .. tostring(sync_error))
+  end
+  local closed, close_error = uv.fs_close(file)
+  if not closed then
+    return cleanup_temporary(nil, temp_path, "could not close note: " .. tostring(close_error))
+  end
+
+  stable, stable_error = validate_existing_directory(parent, configured_real, "note parent")
+  if not stable then
+    return cleanup_temporary(nil, temp_path, stable_error)
+  end
+  return temp_path
+end
+
+local function publish_temporary_note(temp_path, path, parent, directory, configured_real)
+  -- The exclusive hard link publishes complete bytes; a later cleanup/fsync error may leave the target present.
+  local linked, link_error = uv.fs_link(temp_path, path)
+  if linked then
+    local removed, remove_error = uv.fs_unlink(temp_path)
+    local directory_synced, directory_sync_error = sync_directory(parent, "note directory")
+    if removed and directory_synced then
+      return "created"
+    end
+
+    local errors = {}
+    if not removed then
+      errors[#errors + 1] = "note was published but its temporary link could not be removed: " .. tostring(remove_error)
+    end
+    if not directory_synced then
+      errors[#errors + 1] = "note was published but directory synchronization failed: " .. tostring(directory_sync_error)
+    end
+    return invalid(table.concat(errors, "; "))
+  end
+
+  local removed, remove_error = uv.fs_unlink(temp_path)
+  local directory_synced, directory_sync_error = sync_directory(parent, "note directory")
+  local existing, existing_error = valid_existing_target(path, directory, configured_real)
+  if existing and removed and directory_synced then
+    return "existing"
+  end
+
+  local errors = {
+    "could not publish note: " .. tostring(link_error),
+  }
+  if not removed then
+    errors[#errors + 1] = "could not remove temporary note: " .. tostring(remove_error)
+  end
+  if not directory_synced then
+    errors[#errors + 1] = directory_sync_error
+  end
+  if not existing then
+    errors[#errors + 1] = "target validation failed: " .. tostring(existing_error)
+  end
+  return invalid(table.concat(errors, "; "))
+end
+
 
 function M.ensure_file(config, directory, path, lines)
   if type(path) ~= "string" or path == "" then
@@ -353,80 +457,11 @@ function M.ensure_file(config, directory, path, lines)
 
   local data = table.concat(lines, "\n") .. "\n"
   local parent = vim.fs.dirname(path)
-  local temp_template = vim.fs.joinpath(parent, ".vaire-write-XXXXXX")
-  local file, temp_path, temp_error = uv.fs_mkstemp(temp_template)
-  if not file then
-    return invalid("could not create temporary note: " .. tostring(temp_error))
+  local temp_path, prepare_error = prepare_temporary_note(parent, configured_real, data)
+  if not temp_path then
+    return invalid(prepare_error)
   end
-
-  local stable, stable_error = validate_existing_directory(parent, configured_real, "note parent")
-  if not stable then
-    return cleanup_temporary(file, temp_path, stable_error)
-  end
-
-  local chmodded, chmod_error = uv.fs_fchmod(file, NOTE_MODE)
-  if not chmodded then
-    return cleanup_temporary(file, temp_path, "could not set note permissions: " .. tostring(chmod_error))
-  end
-
-  local written, write_error = write_all(file, data)
-  if not written then
-    return cleanup_temporary(file, temp_path, "could not write note: " .. tostring(write_error))
-  end
-
-  local synced, sync_error = uv.fs_fsync(file)
-  if not synced then
-    return cleanup_temporary(file, temp_path, "could not synchronize note: " .. tostring(sync_error))
-  end
-
-  local closed, close_error = uv.fs_close(file)
-  if not closed then
-    return cleanup_temporary(nil, temp_path, "could not close note: " .. tostring(close_error))
-  end
-
-  stable, stable_error = validate_existing_directory(parent, configured_real, "note parent")
-  if not stable then
-    return cleanup_temporary(nil, temp_path, stable_error)
-  end
-
-  local linked, link_error = uv.fs_link(temp_path, path)
-  if linked then
-    local removed, remove_error = uv.fs_unlink(temp_path)
-    local directory_synced, directory_sync_error = sync_directory(parent, "note directory")
-    if removed and directory_synced then
-      return "created"
-    end
-
-    local errors = {}
-    if not removed then
-      errors[#errors + 1] = "note was published but its temporary link could not be removed: " .. tostring(remove_error)
-    end
-    if not directory_synced then
-      errors[#errors + 1] = "note was published but directory synchronization failed: " .. tostring(directory_sync_error)
-    end
-    return invalid(table.concat(errors, "; "))
-  end
-
-  local removed, remove_error = uv.fs_unlink(temp_path)
-  local directory_synced, directory_sync_error = sync_directory(parent, "note directory")
-  local existing, existing_error = valid_existing_target(path, directory, configured_real)
-  if existing and removed and directory_synced then
-    return "existing"
-  end
-
-  local errors = {
-    "could not publish note: " .. tostring(link_error),
-  }
-  if not removed then
-    errors[#errors + 1] = "could not remove temporary note: " .. tostring(remove_error)
-  end
-  if not directory_synced then
-    errors[#errors + 1] = directory_sync_error
-  end
-  if not existing then
-    errors[#errors + 1] = "target validation failed: " .. tostring(existing_error)
-  end
-  return invalid(table.concat(errors, "; "))
+  return publish_temporary_note(temp_path, path, parent, directory, configured_real)
 end
 
 function M.daily_lines()

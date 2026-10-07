@@ -31,6 +31,9 @@ local function close_git_session(session)
   if not session then
     return
   end
+  if session.job_id then
+    pcall(vim.fn.jobstop, session.job_id)
+  end
   if session.win and vim.api.nvim_win_is_valid(session.win) then
     pcall(vim.api.nvim_win_close, session.win, true)
   end
@@ -66,7 +69,8 @@ local function start_git(root)
     local buffer = vim.api.nvim_create_buf(false, true)
     vim.bo[buffer].bufhidden = "wipe"
     vim.bo[buffer].swapfile = false
-    session = { buf = buffer }
+    -- A live terminal belongs to exactly one vault root.
+    session = { buf = buffer, root = root }
     session.win = open_git_window(buffer)
     git_session = session
 
@@ -74,8 +78,8 @@ local function start_git(root)
       cwd = root,
       on_exit = function()
         vim.schedule(function()
+          -- An exited old job must never tear down a session opened for another root.
           if git_session ~= session then
-            return
           end
           git_session = nil
           close_git_session(session)
@@ -94,9 +98,6 @@ local function start_git(root)
     if git_session == session then
       git_session = nil
     end
-    if session and session.job_id then
-      pcall(vim.fn.jobstop, session.job_id)
-    end
     close_git_session(session)
     return nil, "could not open lazygit: " .. tostring(result)
   end
@@ -111,7 +112,7 @@ function M.open_git(root)
     return nil, "lazygit executable was not found on PATH"
   end
   if git_session then
-    if vim.api.nvim_win_is_valid(git_session.win) then
+    if git_session.root == root and vim.api.nvim_win_is_valid(git_session.win) then
       vim.api.nvim_set_current_win(git_session.win)
       return git_session
     end
